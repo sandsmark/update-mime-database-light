@@ -96,7 +96,7 @@ int main(int argc, char *argv[])
     bool newerOnly = false;
 
     filesystem::path mimePath;
-    for (int i=0; i<argc; i++) {
+    for (int i=1; i<argc; i++) {
         if (argv[i][0] != '-') { // assume it is the directory
             mimePath = argv[i];
             continue;
