@@ -18,12 +18,48 @@ struct MimeType {
     std::string subType;
     pugi::xml_document doc;
 };
+
+struct Magic {
+    struct Match {
+        Match(const pugi::xml_node &mimeNode);
+        Match(const Match &) = default;
+        Match() = default;
+
+        int indent = -1;
+        int startOffset = 0;
+        std::vector<uint8_t> value;
+        std::vector<uint8_t> mask;
+        int lengthToCheck = -1;
+    };
+
+    int priority = 0;
+    std::string mimetype;
+    std::vector<Match> matches;
+};
 struct Parser
 {
     void loadSource(const filesystem::path &file);
 
     std::unordered_map<std::string, MimeType> mimeTypes;
     static const std::unordered_set<std::string> knownMediaTypes;
+
+    std::unordered_set<std::string> aliases;
+    std::unordered_set<std::string> subclasses;
+    std::unordered_set<std::string> genericIcons;
+    std::unordered_set<std::string> icons;
+    std::unordered_set<std::string> globs;
+
+private:
+    void parseAliases(const std::string &mimetype, const pugi::xml_node &node);
+    void parseMagic(const pugi::xml_node &mimeNode);
+    void parseFields(
+            const char *fieldname,
+            const char *attribute,
+            const std::string &mimetype,
+            const pugi::xml_node &mimeNode,
+            std::unordered_set<std::string> *set,
+            const char separator
+            );
 };
 
 const std::unordered_set<std::string> Parser::knownMediaTypes = {
@@ -45,6 +81,35 @@ const std::unordered_set<std::string> Parser::knownMediaTypes = {
     "font",
 };
 
+static bool s_verbose = false;
+
+Magic::Match::Match(const pugi::xml_node &mimeNode)
+{
+}
+
+void Parser::parseFields(
+            const char *fieldname,
+            const char *attribute,
+            const std::string &mimetype,
+            const pugi::xml_node &mimeNode,
+            std::unordered_set<std::string> *set,
+            const char separator
+        )
+{
+    for (pugi::xml_node aliasNode = mimeNode.child(fieldname); aliasNode; aliasNode = aliasNode.next_sibling(fieldname)) {
+        const std::string type = aliasNode.attribute(attribute).value();
+        if (type.empty()) {
+            std::cerr << "Invalid alias node" << std::endl;
+            continue;
+        }
+        set->insert(type + separator + mimetype);
+    }
+}
+
+void Parser::parseMagic(const pugi::xml_node &mimeNode)
+{
+}
+
 void Parser::loadSource(const filesystem::path &file)
 {
     pugi::xml_document doc;
@@ -65,26 +130,36 @@ void Parser::loadSource(const filesystem::path &file)
             continue;
         }
 
+        parseFields("alias", "type", type, sourceNode, &aliases, ' ');
+        parseFields("sub-class-of", "type", type, sourceNode, &subclasses, ' ');
+        parseFields("generic-icon", "name", type, sourceNode, &genericIcons, ':');
+        parseFields("icon", "name", type, sourceNode, &icons, ':');
+        parseFields("glob", "pattern", type, sourceNode, &globs, ':');
+
+        parseMagic(sourceNode);
+
         MimeType mimeType;
         mimeType.media = type.substr(0, slashPos);
         mimeType.subType = type.substr(slashPos + 1);
-        pugi::xml_node mimeNode = mimeType.doc.append_child("mime-type");
-        mimeNode.append_attribute("type").set_value(type.c_str());
-        mimeTypes[type] = std::move(mimeType);
+        mimeType.doc.append_copy(sourceNode);
 
         if (!knownMediaTypes.count(mimeType.media)) {
-            std::cerr << "Unknown media type " << mimeType.media << std::endl;
+            std::cerr << "Unknown media type '" << mimeType.media << "'" << std::endl;
         }
 
-        for (pugi::xml_attribute attr = sourceNode.first_attribute(); attr; attr = attr.next_attribute()) {
-            std::cout << " " << attr.name() << "=" << attr.value() << std::endl;;
+        if (s_verbose) {
+            for (pugi::xml_attribute attr = sourceNode.first_attribute(); attr; attr = attr.next_attribute()) {
+                std::cout << " " << attr.name() << "=" << attr.value() << std::endl;;
+            }
+            int foo = 0;
+            if (foo++ < 10) {
+                mimeType.doc.save(std::cout);
+            }
         }
-
+        mimeTypes[type] = std::move(mimeType);
     }
 
 }
-
-static bool s_verbose = false;
 
 void print_usage(const char *executable)
 {
