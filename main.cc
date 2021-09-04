@@ -4,6 +4,9 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <list>
+#include <set>
+#include <fstream>
 
 #include <filesystem>
 // it has obnoxiously long names thanks to the boost influence
@@ -12,6 +15,7 @@ using std::filesystem::exists;
 using std::filesystem::last_write_time;
 using std::filesystem::directory_iterator;
 using std::filesystem::directory_entry;
+using std::filesystem::create_directory;
 
 struct MimeType {
     std::string media;
@@ -30,19 +34,27 @@ struct Magic {
         Match() = default;
 
         int indent = -1;
-        int startOffset = 0;
-        std::vector<uint8_t> value;
-        std::vector<uint8_t> mask;
+        std::string type;
+        std::string offset;
+        std::string value;
+        std::string mask;
         int lengthToCheck = -1;
     };
 
     int priority = 0;
     std::string mimetype;
     std::vector<Match> matches;
+
+    Magic(const Magic&) = delete;
+
+    Magic(const std::string &type, const pugi::xml_node &mimeNode);
 };
+
 struct Parser
 {
     void loadSource(const filesystem::path &file);
+
+    std::set<std::string> typeNames;
 
     std::unordered_map<std::string, MimeType> mimeTypes;
     static const std::unordered_set<std::string> knownMediaTypes;
@@ -54,14 +66,17 @@ struct Parser
     std::unordered_set<std::string> globs;
     std::unordered_set<std::string> xmlNamespaces;
 
-private:
-    void addMimetype(const std::string &type, MimeType &&mimeType, const pugi::xml_node &sourceNode);
+    std::unordered_set<std::string> globs2;
 
-    void parseAliases(const std::string &mimetype, const pugi::xml_node &node);
-    void parseMagic(const pugi::xml_node &mimeNode);
-    void parseXMLNamespaces(const pugi::xml_node &mimeNode);
+    std::list<Magic> magics;
+
+private:
+    bool addMimetype(const std::string &type, const pugi::xml_node &sourceNode);
+
+    void parseMagic(const std::string &type, const pugi::xml_node &mimeNode);
+    void parseXMLNamespaces(const std::string &type, const pugi::xml_node &mimeNode);
     void parseFields(
-            const char *fieldname,
+            const std::string &fieldname,
             const char *attribute,
             const std::string &mimetype,
             const pugi::xml_node &mimeNode,
@@ -91,12 +106,16 @@ const std::unordered_set<std::string> Parser::knownMediaTypes = {
 
 static bool s_verbose = false;
 
-Magic::Match::Match(const pugi::xml_node &mimeNode)
+Magic::Match::Match(const pugi::xml_node &matchNode)
 {
+    type = matchNode.attribute("type").value();
+    value = matchNode.attribute("value").value();
+    offset = matchNode.attribute("offset").value();
+    mask = matchNode.attribute("mask").value();
 }
 
 void Parser::parseFields(
-            const char *fieldname,
+            const std::string &fieldname,
             const char *attribute,
             const std::string &mimetype,
             const pugi::xml_node &mimeNode,
@@ -104,32 +123,93 @@ void Parser::parseFields(
             const char separator
         )
 {
-    for (pugi::xml_node aliasNode = mimeNode.child(fieldname); aliasNode; aliasNode = aliasNode.next_sibling(fieldname)) {
+    for (pugi::xml_node aliasNode = mimeNode.child(fieldname.c_str()); aliasNode; aliasNode = aliasNode.next_sibling(fieldname.c_str())) {
         const std::string type = aliasNode.attribute(attribute).value();
         if (type.empty()) {
             std::cerr << "Invalid alias node" << std::endl;
             continue;
         }
-        set->insert(type + separator + mimetype);
+        const std::string line = type + separator + mimetype;
+        set->insert(line);
+
+        if (fieldname == "glob") {
+            std::string weight = aliasNode.attribute("weight").value();
+            if (weight.empty()) {
+                weight = "50";
+            }
+            globs2.insert(weight + ":" + line);
+        }
     }
 }
 
-void Parser::parseMagic(const pugi::xml_node &mimeNode)
+Magic::Magic(const std::string &type, const pugi::xml_node &aliasNode)
 {
+    mimetype = type;
+    try {
+        const std::string pristr = aliasNode.attribute("priority").value();
+        if (!pristr.empty()) {
+            priority = std::stoi(pristr);
+        }
+    } catch (const std::exception&) { }
+
+    for (pugi::xml_node matchNode = aliasNode.child("match"); matchNode; matchNode = matchNode.next_sibling("match")) {
+        matches.emplace_back(matchNode);
+    }
 }
 
-void Parser::parseXMLNamespaces(const pugi::xml_node &mimeNode)
+void Parser::parseMagic(const std::string &type, const pugi::xml_node &mimeNode)
 {
+    if (mimeNode.child("magic-deleteall")) {
+        std::list<Magic>::iterator it = magics.begin();
+        while (it != magics.end()) {
+            if (it->mimetype == type) {
+                it = magics.erase(it);
+                continue;
+            }
+            it++;
+        }
+    }
+
+    for (pugi::xml_node aliasNode = mimeNode.child("magic"); aliasNode; aliasNode = aliasNode.next_sibling("magic")) {
+        magics.emplace_back(type, aliasNode);
+    }
 }
 
-void Parser::addMimetype(const std::string &type, MimeType &&mimeType, const pugi::xml_node &sourceNode)
+void Parser::parseXMLNamespaces(const std::string &type, const pugi::xml_node &mimeNode)
 {
-    std::unordered_map<std::string, MimeType>::iterator it =
-        mimeTypes.try_emplace(type, std::move(mimeType)).first;
+    for (pugi::xml_node aliasNode = mimeNode.child("root-XML"); aliasNode; aliasNode = aliasNode.next_sibling("root-XML")) {
+        const std::string uri = aliasNode.attribute("namespaceURI").value();
+        const std::string name = aliasNode.attribute("localName").value();
+        if (uri.empty() || name.empty()) {
+            std::cerr << "Invalid namespace node" << std::endl;
+            continue;
+        }
+        xmlNamespaces.insert(uri + " " + name + " " + type);
+    }
+}
 
-    pugi::xml_node mimeNode = it->second.doc->child("mime-type");
+bool Parser::addMimetype(const std::string &type, const pugi::xml_node &sourceNode)
+{
+    std::string::size_type slashPos = type.find('/');
+    if (slashPos == std::string::npos) {
+        std::cerr << "Invalid type " << type << std::endl;
+        return false;
+    }
+
+    MimeType &mimeType = mimeTypes.try_emplace(type).first->second;
+
+    if (mimeType.media.empty()) {
+        mimeType.media = type.substr(0, slashPos);
+        mimeType.subType = type.substr(slashPos + 1);
+
+        if (!knownMediaTypes.count(mimeType.media)) {
+            std::cerr << "Unknown media type '" << mimeType.media << "'" << std::endl;
+        }
+    }
+
+    pugi::xml_node mimeNode = mimeType.doc->child("mime-type");
     if (!mimeNode) {
-        mimeNode = it->second.doc->append_child("mime-type");
+        mimeNode = mimeType.doc->append_child("mime-type");
     }
 
     for (pugi::xml_attribute attr = sourceNode.first_attribute(); attr; attr = attr.next_attribute()) {
@@ -138,14 +218,20 @@ void Parser::addMimetype(const std::string &type, MimeType &&mimeType, const pug
 
     for (pugi::xml_node child = sourceNode.first_child(); child; child = child.next_sibling()) {
         const std::string name = child.name();
-        if (name == "magic") {
+        if (name.empty()) {
             continue;
         }
-        if (name == "glob") {
-            continue;
-        }
-        if (name == "root-XML") {
-            continue;
+        const char first = name[0];
+        if (first == 'm' || first == 'g' || first == 'r') {
+            if (name == "magic") {
+                continue;
+            }
+            if (name == "glob") {
+                continue;
+            }
+            if (name == "root-XML") {
+                continue;
+            }
         }
         mimeNode.append_copy(child);
     }
@@ -156,9 +242,10 @@ void Parser::addMimetype(const std::string &type, MimeType &&mimeType, const pug
         }
         int foo = 0;
         if (foo++ < 10) {
-            it->second.doc->save(std::cout);
+            mimeType.doc->save(std::cout);
         }
     }
+    return true;
 }
 
 void Parser::loadSource(const filesystem::path &file)
@@ -175,9 +262,8 @@ void Parser::loadSource(const filesystem::path &file)
             std::cerr << "Invalid node" << std::endl;
             continue;
         }
-        std::string::size_type slashPos = type.find('/');
-        if (slashPos == std::string::npos) {
-            std::cerr << "Invalid type " << type << std::endl;
+
+        if (!addMimetype(type, sourceNode)) {
             continue;
         }
 
@@ -187,23 +273,32 @@ void Parser::loadSource(const filesystem::path &file)
         parseFields("icon", "name", type, sourceNode, &icons, ':');
         parseFields("glob", "pattern", type, sourceNode, &globs, ':');
 
-        parseMagic(sourceNode);
-
-        MimeType mimeType;
-        mimeType.media = type.substr(0, slashPos);
-        mimeType.subType = type.substr(slashPos + 1);
-
-        if (!knownMediaTypes.count(mimeType.media)) {
-            std::cerr << "Unknown media type '" << mimeType.media << "'" << std::endl;
-        }
-
-        addMimetype(type, std::move(mimeType), sourceNode);
+        parseXMLNamespaces(type, sourceNode);
+        parseMagic(type, sourceNode);
+        typeNames.insert(type);
     }
 }
 
 void print_usage(const char *executable)
 {
     std::cout << "Usage: " << executable << " [-hvVn] MIME-DIR" << std::endl;
+}
+
+template<typename Container>
+static void writeFile(const std::string &filename, const Container &content, bool writeHeader = false)
+{
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open " << filename << " for writing" << std::endl;
+        return;
+    }
+    if (writeHeader) {
+        file << "# This file was automatically generated by the\n"
+                "# update-mime-database command. DO NOT EDIT!\n";
+    }
+    for (const std::string &line : content) {
+        file << line << "\n";
+    }
 }
 
 int main(int argc, char *argv[])
@@ -250,12 +345,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    const bool upToDate = last_write_time(mimePath/"version") >= last_write_time(packagesPath);
-    if (upToDate && newerOnly) {
-        if (s_verbose) {
-            std::cout << "Up to date." << std::endl;
+    filesystem::path versionPath = mimePath/"version";
+    if (exists(versionPath)) {
+        const bool upToDate = last_write_time(versionPath) >= last_write_time(packagesPath);
+        if (upToDate && newerOnly) {
+            if (s_verbose) {
+                std::cout << "Up to date." << std::endl;
+            }
+            return 0;
         }
-        return 0;
     }
 
     if (s_verbose) {
@@ -287,6 +385,27 @@ int main(int argc, char *argv[])
     Parser parser;
     for (const filesystem::path &file : files) {
         parser.loadSource(file);
+    }
+
+    writeFile(mimePath / "XMLnamespaces", parser.xmlNamespaces);
+    writeFile(mimePath / "globs", parser.globs, true);
+    writeFile(mimePath / "aliases", parser.aliases);
+    writeFile(mimePath / "generic-icons", parser.genericIcons);
+    writeFile(mimePath / "icons", parser.icons);
+    writeFile(mimePath / "subclasses", parser.subclasses);
+    writeFile(mimePath / "types", parser.typeNames);
+
+    std::vector<std::string> globs2(parser.globs2.begin(), parser.globs2.end());
+    std::sort(globs2.begin(), globs2.end(), std::greater<std::string>());
+    writeFile(mimePath / "globs2", globs2, true);
+
+    writeFile(mimePath / "version", std::vector<std::string>({"2.1"}));
+
+    for (const std::pair<const std::string, MimeType> &p : parser.mimeTypes) {
+        const MimeType &mimeType = p.second;
+        create_directory(mimePath / mimeType.media);
+        const filesystem::path path = mimePath / mimeType.media / (mimeType.subType + ".xml");
+        mimeType.doc->save_file(path.c_str());
     }
 
     return 0;
